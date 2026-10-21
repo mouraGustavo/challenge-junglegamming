@@ -1,0 +1,38 @@
+{
+  "name": "challenge-junglegamming",
+  "version": "0.3.0",
+  "private": true,
+  "engines": {
+    "bun": ">=1.0.0 <2"
+  },
+  "scripts": {
+    "dev": "bun --watch src/main.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "bun dist/src/main.js",
+    "typecheck": "tsc --noEmit",
+    "infra:init": "bun scripts/init-queues.ts",
+    "db:migrate": "bun scripts/migrate.ts up",
+    "db:status": "bun scripts/migrate.ts status",
+    "db:rollback": "bun scripts/migrate.ts down",
+    "test:unit": "bun test ./tests/unit",
+    "test:db": "bun test --timeout 30000 ./tests/integration/schema.test.ts",
+    "test:finance": "bun test --timeout 60000 ./tests/integration/financial.test.ts",
+    "test:http": "bun test --timeout 30000 ./tests/integration/http.test.ts",
+    "test:integration": "bun run test:db && bun run test:finance && bun run test:http",
+    "test": "bun run test:unit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-sqs": "3.758.0",
+    "@mikro-orm/core": "6.4.16",
+    "@mikro-orm/postgresql": "6.4.16",
+    "@nestjs/common": "11.2.7",
+    "@nestjs/core": "11.2.7",
+    "@nestjs/platform-express": "11.2.7",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2"
+  },
+  "devDependencies": {
+    "@types/node": "22.13.10",
+    "typescript": "5.8.2"
+  }
+}
