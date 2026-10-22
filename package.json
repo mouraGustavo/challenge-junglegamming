@@ -1,6 +1,6 @@
 {
   "name": "challenge-junglegamming",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "private": true,
   "engines": {
     "bun": ">=1.0.0 <2"
@@ -9,6 +9,7 @@
     "dev": "bun --watch src/main.ts",
     "build": "tsc -p tsconfig.json",
     "start": "bun dist/src/main.js",
+    "worker": "bun dist/src/worker.js",
     "typecheck": "tsc --noEmit",
     "infra:init": "bun scripts/init-queues.ts",
     "db:migrate": "bun scripts/migrate.ts up",
@@ -18,7 +19,10 @@
     "test:db": "bun test --timeout 30000 ./tests/integration/schema.test.ts",
     "test:finance": "bun test --timeout 60000 ./tests/integration/financial.test.ts",
     "test:http": "bun test --timeout 30000 ./tests/integration/http.test.ts",
-    "test:integration": "bun run test:db && bun run test:finance && bun run test:http",
+    "test:messaging": "bun test --timeout 90000 ./tests/integration/messaging.test.ts",
+    "test:distributed": "docker compose build setup && bun test --timeout 240000 ./tests/integration/distributed.test.ts",
+    "test:all": "bun run typecheck && bun run build && bun run test:unit && bun run test:integration && bun run test:distributed",
+    "test:integration": "bun run test:db && bun run test:finance && bun run test:http && bun run test:messaging",
     "test": "bun run test:unit"
   },
   "dependencies": {

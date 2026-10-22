@@ -3,7 +3,8 @@ export type FailureCode =
   | 'INSUFFICIENT_FUNDS' | 'REVERSAL_INSUFFICIENT_FUNDS'
   | 'INVALID_TRANSACTION_STATE' | 'INVALID_REFERENCE'
   | 'REFERENCE_NOT_FOUND' | 'REFERENCE_NOT_PROCESSED'
-  | 'REVERSAL_ALREADY_PROCESSED' | 'IDEMPOTENCY_CONFLICT';
+  | 'REVERSAL_ALREADY_PROCESSED' | 'IDEMPOTENCY_CONFLICT'
+  | 'INFRASTRUCTURE_RETRY_EXHAUSTED';
 
 export class DomainError extends Error {
   constructor(public readonly code: FailureCode, message: string = code) {

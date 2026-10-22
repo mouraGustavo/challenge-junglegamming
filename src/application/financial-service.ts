@@ -10,13 +10,18 @@ import { payloadHash } from '../domain/payload-hash';
 import { WagerTransaction, type WagerKind, type WagerStatus } from '../domain/wager-transaction';
 import type { WalletLedgerEntry } from '../domain/ledger-entry';
 import { IntegrationEvent, WalletBalanceChanged, WagerTransactionProcessed,
-  WagerTransactionRejected, WagerTransactionPendingReference } from '../domain/events';
+  WagerTransactionRejected, WagerTransactionPendingReference, WagerTransactionFailed } from '../domain/events';
+import { InboxMessage } from '../domain/inbox-message';
+import { OutboxMessage, retryDelay } from '../domain/outbox-message';
 import { InboxRecord, LedgerRecord, OutboxRecord, WagerRecord, WalletRecord } from '../persistence/records';
+import { structuredLog, telemetry } from '../observability/telemetry';
 
 export interface ProcessingContext {
   correlationId?: string;
   causationId?: string;
   inbox?: { consumerName: string; messageId: string };
+  /** Somente o canal interno pode registrar esgotamento de retries. */
+  terminalFailure?: 'INFRASTRUCTURE_RETRY_EXHAUSTED';
 }
 export interface WagerResult {
   transactionId: string;
@@ -26,7 +31,7 @@ export interface WagerResult {
   idempotentReplay: boolean;
 }
 
-/** Um único limite transacional para HTTP e, no próximo bloco, SQS. */
+/** Um único limite transacional para HTTP e SQS. */
 export class FinancialService {
   constructor(private readonly database: () => Promise<MikroORM>) {}
 
@@ -67,6 +72,30 @@ export class FinancialService {
   }
 
   async process(input: unknown, key: unknown, context: ProcessingContext = {}): Promise<WagerResult> {
+    const payload = wagerInput(input);
+    context = { ...context, correlationId: context.correlationId ?? randomUUID() };
+    const started = performance.now();
+    try {
+      const result = await this.processTransaction(payload, key, context);
+      if (result.idempotentReplay) telemetry.increment('duplicates');
+      structuredLog('info', 'transaction_result', { correlationId: context.correlationId,
+        messageId: context.inbox?.messageId, transactionId: result.transactionId, walletId: payload.walletId,
+        providerId: payload.providerId, status: result.status, idempotentReplay: result.idempotentReplay });
+      return result;
+    } catch (error) {
+      const code = databaseCode(error);
+      if (code === '55P03' || code === '40P01') telemetry.increment('lock_conflicts');
+      if (error instanceof ApplicationError && ['IDEMPOTENCY_CONFLICT', 'INBOX_PAYLOAD_CONFLICT', 'EXTERNAL_TRANSACTION_CONFLICT'].includes(error.code)) {
+        telemetry.increment('idempotency_conflicts');
+      }
+      structuredLog('warn', 'transaction_error', { correlationId: context.correlationId,
+        messageId: context.inbox?.messageId, walletId: payload.walletId, providerId: payload.providerId,
+        code: error instanceof ApplicationError || error instanceof DomainError ? error.code : code ?? 'INFRASTRUCTURE_ERROR' });
+      throw error;
+    } finally { telemetry.observeProcessing((performance.now() - started) / 1000); }
+  }
+
+  private async processTransaction(input: unknown, key: unknown, context: ProcessingContext): Promise<WagerResult> {
     context = { ...context, correlationId: context.correlationId ?? randomUUID() };
     const payload = wagerInput(input);
     if (key === undefined) throw new ApplicationError('IDEMPOTENCY_KEY_REQUIRED', 400);
@@ -80,6 +109,7 @@ export class FinancialService {
       try {
         return await orm.em.fork().transactional(async (em) => {
           await em.getConnection().execute("set local lock_timeout = '3s'", [], 'run', em.getTransactionContext());
+          await em.getConnection().execute("set local statement_timeout = '10s'", [], 'run', em.getTransactionContext());
           const identity = await em.findOne(WagerRecord, { idempotencyKey });
           if (identity && identity.payloadHash !== hash) throw new ApplicationError('IDEMPOTENCY_CONFLICT', 409);
           const stored = await em.findOne(WalletRecord, payload.walletId, { lockMode: LockMode.PESSIMISTIC_WRITE });
@@ -97,12 +127,14 @@ export class FinancialService {
               if (inbox.payloadHash !== inboxHash) throw new ApplicationError('INBOX_PAYLOAD_CONFLICT', 409);
               if (inbox.processedAt && inbox.result) return this.replay(inbox.result);
             } else {
-              inbox = Object.assign(new InboxRecord(), identity, { payloadHash: inboxHash, receivedAt: new Date() });
+              const message = InboxMessage.receive({ ...identity, payloadHash: inboxHash, receivedAt: new Date() });
+              inbox = Object.assign(new InboxRecord(), identity, { payloadHash: message.payloadHash, receivedAt: message.receivedAt });
               em.persist(inbox);
             }
           }
 
-          const existing = await em.findOne(WagerRecord, { idempotencyKey });
+          // O primeiro lookup precede o lock; atualizar a instância gerenciada após esperar.
+          const existing = await em.findOne(WagerRecord, { idempotencyKey }, { refresh: true });
           if (existing) {
             if (existing.payloadHash !== hash) throw new ApplicationError('IDEMPOTENCY_CONFLICT', 409);
             if (!existing.result) throw new Error('MISSING_PERSISTED_RESULT');
@@ -118,39 +150,9 @@ export class FinancialService {
           const at = new Date();
           const transaction = WagerTransaction.create({ ...payload, id: randomUUID(), idempotencyKey,
             payloadHash: hash, money: Money.from(payload.money), createdAt: at });
-          let reference: WagerTransaction | undefined;
           let entry: WalletLedgerEntry | undefined;
-          try {
-            if (transaction.requiresReference()) {
-              const found = await em.findOne(WagerRecord, { providerId: payload.providerId,
-                externalTransactionId: payload.referenceExternalTransactionId! });
-              if (!found) {
-                transaction.markPendingReference();
-              } else {
-                reference = this.toDomain(found);
-                // Referência ainda não terminal aguarda processamento, sem perder a operação.
-                if (!reference.isTerminal()) transaction.markPendingReference();
-                else transaction.validateReference(reference);
-              }
-            }
-            if (transaction.status !== 'PENDING_REFERENCE') {
-              if (reference && (transaction.kind === 'REFUND' || transaction.kind === 'ROLLBACK')) {
-                const reversal = await em.findOne(WagerRecord, { referenceTransactionId: reference.id,
-                  kind: transaction.kind, status: 'PROCESSED' });
-                if (reversal) throw new DomainError('REVERSAL_ALREADY_PROCESSED');
-              }
-              if (transaction.affectsBalance()) {
-                const movement = { entryId: randomUUID(), transactionId: transaction.id,
-                  money: transaction.money, at };
-                entry = transaction.ledgerDirectionFor(reference) === 'DEBIT'
-                  ? wallet.debit(movement, transaction.kind === 'ROLLBACK') : wallet.credit(movement);
-              }
-              transaction.markProcessed(reference?.id, at);
-            }
-          } catch (error) {
-            if (!(error instanceof DomainError)) throw error;
-            transaction.reject(error.code);
-          }
+          if (context.terminalFailure) transaction.fail(context.terminalFailure);
+          else entry = await this.applyMovement(em, transaction, wallet, at);
 
           const result = this.result(transaction, wallet);
           const record = this.record(transaction, { ...payload, idempotencyKey, payloadHash: hash, createdAt: at }, result);
@@ -172,8 +174,80 @@ export class FinancialService {
         });
       } catch (error) {
         if (attempt >= 2 || !['23505', '40001', '40P01'].includes(databaseCode(error) ?? '')) throw error;
+        telemetry.retry('sql');
+        if (databaseCode(error) === '40P01') telemetry.increment('lock_conflicts');
         await new Promise((resolve) => setTimeout(resolve, 10 * (attempt + 1)));
       }
+    }
+  }
+
+  /** Mesmo domínio e mesma ordem de locks do processamento inicial: wallet → wager. */
+  async retryReference(id: string, now = new Date(), maxAttempts = 10): Promise<boolean> {
+    const orm = await this.database();
+    const candidate = await orm.em.fork().findOne(WagerRecord, uuid(id));
+    if (!candidate || candidate.status !== 'PENDING_REFERENCE') return false;
+    return orm.em.fork().transactional(async (em) => {
+      await em.getConnection().execute("set local lock_timeout = '3s'", [], 'run', em.getTransactionContext());
+      await em.getConnection().execute("set local statement_timeout = '10s'", [], 'run', em.getTransactionContext());
+      const stored = await em.findOneOrFail(WalletRecord, candidate.walletId, { lockMode: LockMode.PESSIMISTIC_WRITE });
+      const record = await em.findOneOrFail(WagerRecord, id, { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true });
+      if (record.status !== 'PENDING_REFERENCE' || !record.nextAttemptAt || record.nextAttemptAt > now) return false;
+      const wallet = stored.toDomain();
+      const transaction = this.toDomain(record);
+      const entry = await this.applyMovement(em, transaction, wallet, now);
+      record.referenceAttempts += 1;
+      if (transaction.status === 'PENDING_REFERENCE' && record.referenceAttempts >= maxAttempts) {
+        transaction.reject('REFERENCE_NOT_FOUND');
+      }
+      em.assign(record, { status: transaction.status, referenceTransactionId: transaction.referenceTransactionId,
+        processedAt: transaction.processedAt, failureCode: transaction.failureCode,
+        result: { ...this.result(transaction, wallet) },
+        nextAttemptAt: transaction.status === 'PENDING_REFERENCE'
+          ? new Date(now.getTime() + retryDelay(record.referenceAttempts)) : null });
+      const context = { correlationId: transaction.id, causationId: transaction.id };
+      if (entry) {
+        em.assign(stored, { balance: wallet.balance.toString(), version: wallet.version, updatedAt: wallet.updatedAt });
+        em.persist(this.ledgerRecord(entry));
+        this.enqueue(em, WalletBalanceChanged.from(wallet, entry, this.eventContext(context)));
+      }
+      // A primeira pendência já publicou seu evento. Retries sem transição não o repetem.
+      if (transaction.isTerminal()) this.enqueueStatus(em, transaction, context);
+      await em.flush();
+      return true;
+    });
+  }
+
+  private async applyMovement(em: EntityManager, transaction: WagerTransaction, wallet: Wallet,
+    at: Date): Promise<WalletLedgerEntry | undefined> {
+    try {
+      let reference: WagerTransaction | undefined;
+      if (transaction.requiresReference()) {
+        const found = await em.findOne(WagerRecord, { providerId: transaction.providerId,
+          externalTransactionId: transaction.referenceExternalTransactionId! });
+        if (!found || !this.toDomain(found).isTerminal()) {
+          transaction.markPendingReference();
+          return undefined;
+        }
+        reference = this.toDomain(found);
+        transaction.validateReference(reference);
+      }
+      if (reference && (transaction.kind === 'REFUND' || transaction.kind === 'ROLLBACK')) {
+        if (await em.findOne(WagerRecord, { referenceTransactionId: reference.id, kind: transaction.kind, status: 'PROCESSED' })) {
+          throw new DomainError('REVERSAL_ALREADY_PROCESSED');
+        }
+      }
+      let entry: WalletLedgerEntry | undefined;
+      if (transaction.affectsBalance()) {
+        const movement = { entryId: randomUUID(), transactionId: transaction.id, money: transaction.money, at };
+        entry = transaction.ledgerDirectionFor(reference) === 'DEBIT'
+          ? wallet.debit(movement, transaction.kind === 'ROLLBACK') : wallet.credit(movement);
+      }
+      transaction.markProcessed(reference?.id, at);
+      return entry;
+    } catch (error) {
+      if (!(error instanceof DomainError)) throw error;
+      transaction.reject(error.code);
+      return undefined;
     }
   }
 
@@ -253,6 +327,10 @@ export class FinancialService {
       [walletId], 'all', em.getTransactionContext());
       const stored = record.toDomain().balance;
       const calculated = Money.rehydrate({ amount: row.calculated, currency: record.currency });
+      if (!stored.equals(calculated)) {
+        telemetry.increment('reconciliation_divergences');
+        structuredLog('warn', 'reconciliation_divergence', { walletId, correlationId: randomUUID() });
+      }
       return { walletId, storedBalance: stored.toJSON(), calculatedBalance: calculated.toJSON(),
         difference: stored.subtract(calculated).toJSON(), consistent: stored.equals(calculated), checkedEntries: Number(row.total) };
     });
@@ -278,7 +356,12 @@ export class FinancialService {
     return { ...structuredClone(result), idempotentReplay: true } as unknown as WagerResult;
   }
   private finishInbox(inbox: InboxRecord | undefined, result: WagerResult): void {
-    if (inbox) { inbox.result = { ...result }; inbox.processedAt = new Date(); }
+    if (inbox) {
+      const message = InboxMessage.rehydrate(inbox);
+      message.markProcessed(new Date());
+      inbox.result = { ...result };
+      inbox.processedAt = message.processedAt;
+    }
   }
   private record(transaction: WagerTransaction, props: {
     providerId: string; gameId: string; idempotencyKey: string; payloadHash: string; createdAt: Date;
@@ -307,9 +390,10 @@ export class FinancialService {
       causationId: context.causationId, occurredAt: new Date() };
   }
   private enqueue(em: EntityManager, event: IntegrationEvent<object>): void {
-    em.persist(Object.assign(new OutboxRecord(), { id: event.eventId, aggregateId: event.aggregateId,
-      eventType: event.eventType, payload: { ...event.toJSON() }, occurredAt: event.occurredAt,
-      attempts: 0, nextAttemptAt: event.occurredAt }));
+    const message = OutboxMessage.enqueue(event);
+    em.persist(Object.assign(new OutboxRecord(), { id: message.id, aggregateId: message.aggregateId,
+      eventType: message.eventType, payload: message.payload, occurredAt: message.occurredAt,
+      attempts: message.attempts, nextAttemptAt: message.nextAttemptAt }));
   }
   private enqueueStatus(em: EntityManager, transaction: WagerTransaction, context: ProcessingContext): void {
     const data = { transactionId: transaction.id, walletId: transaction.walletId,
@@ -318,6 +402,7 @@ export class FinancialService {
     const ctx = this.eventContext(context);
     if (transaction.status === 'PROCESSED') this.enqueue(em, WagerTransactionProcessed.from(data, ctx));
     else if (transaction.status === 'REJECTED') this.enqueue(em, WagerTransactionRejected.from(data, ctx));
+    else if (transaction.status === 'FAILED') this.enqueue(em, WagerTransactionFailed.from(data, ctx));
     else this.enqueue(em, WagerTransactionPendingReference.from(data, ctx));
   }
 }

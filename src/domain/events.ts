@@ -61,6 +61,14 @@ export class WagerTransactionPendingReference extends IntegrationEvent<WagerEven
   }
 }
 
+export class WagerTransactionFailed extends IntegrationEvent<WagerEventData> {
+  readonly eventType = 'WagerTransactionFailed';
+  readonly version = 1;
+  static from(data: WagerEventData, ctx: EventContext): WagerTransactionFailed {
+    return new WagerTransactionFailed({ ...ctx, aggregateId: data.walletId, data });
+  }
+}
+
 interface WalletBalanceChangedData {
   walletId: string; transactionId: string; direction: LedgerDirection; money: MoneyProps;
   balanceBefore: MoneyProps; balanceAfter: MoneyProps; walletVersion: number;
