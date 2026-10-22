@@ -15,5 +15,7 @@ export const config = {
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test',
     },
     maxAttempts: 1,
+    // QueueUrl do LocalStack pode anunciar localhost; o endpoint varia entre host e Compose.
+    useQueueUrlAsEndpoint: false,
   },
 };

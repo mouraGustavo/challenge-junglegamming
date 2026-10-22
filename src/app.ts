@@ -7,9 +7,10 @@ import { FinancialService } from './application/financial-service';
 import { FinancialController } from './http/financial.controller';
 import { ErrorFilter } from './http/error.filter';
 import { DevelopmentProviderIdentity, ProviderIdentityPort } from './http/provider-identity';
+import { MetricsController } from './observability/metrics.controller';
 
 @Module({
-  controllers: [HealthController, FinancialController],
+  controllers: [HealthController, FinancialController, MetricsController],
   providers: [InfrastructureService,
     { provide: FinancialService, inject: [InfrastructureService],
       useFactory: (infrastructure: InfrastructureService) => new FinancialService(() => infrastructure.database()) },

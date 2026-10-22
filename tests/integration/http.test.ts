@@ -92,6 +92,13 @@ test('HTTP real: contratos, códigos, consultas, health e replay', async () => {
     const ready = await request('/health/ready');
     assert.equal(ready.status, 200);
     assert.deepEqual(ready.body.checks, { postgres: true, sqs: true });
+    const metrics = await (await fetch(`${base}/metrics`)).text();
+    assert.match(metrics, /wagering_duplicates_total 1/);
+    assert.match(metrics, /wagering_lock_conflicts_total 1/);
+    assert.match(metrics, /wagering_idempotency_conflicts_total 1/);
+    assert.match(metrics, /wagering_transactions\{status="PROCESSED"\} [1-9]/);
+    assert.match(metrics, /wagering_outbox_lag_seconds [0-9]/);
+    assert.match(metrics, /wagering_processing_duration_seconds_count [1-9]/);
   } finally {
     await app.close();
     config.database.dbName = originalName;

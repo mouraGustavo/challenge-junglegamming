@@ -1,162 +1,246 @@
-# Arquitetura — decisões e evolução
+# Arquitetura
 
-## Escopo implementado até o bloco 03
+## Visão geral
 
-Base NestJS, health checks de PostgreSQL/SQS, filas locais, domínio financeiro,
-mapeamento MikroORM, migration inicial, HTTP financeiro, caso de uso transacional
-compartilhável, inbox transacional e eventos persistidos na outbox. Consumidor
-SQS, publishers, worker de referências e observabilidade financeira completa
-ainda serão implementados.
+A aplicação recebe operações de apostas por HTTP ou SQS. As duas entradas
+chamam o mesmo `FinancialService`, para não manter regras diferentes em cada
+caminho.
+
+Usei um único projeto, com a API e o worker executados em processos separados.
+O worker recebe mensagens, publica eventos e tenta novamente as operações que
+dependem de uma referência. O Compose sobe três APIs e três workers para testar
+a concorrência entre instâncias.
 
 ## Dinheiro
 
-Money armazena centavos como `bigint`, mantém moeda e é imutável. Como o desafio
-fixa escala 2 e só exige soma/subtração/comparação, inteiros são suficientes e
-reduzem dependências. Esta escolha substitui a proposta inicial de decimal.js.
-Nenhum valor monetário passa por `number`, `parseFloat` ou `Number`. Versões,
-contagens, portas e durações podem usar `number`.
+`Money` guarda o valor em centavos usando `bigint`. Por exemplo, `25.50` fica
+armazenado internamente como `2550n`. Como o desafio trabalha com duas casas
+decimais e só precisa de soma, subtração e comparação, essa representação foi
+suficiente e evitou adicionar uma biblioteca decimal.
 
-Entrada/JSON e PostgreSQL usam strings decimais. Entradas com 0, 1 ou 2 casas
-são normalizadas para 2 na saída. Mais de 2 casas são rejeitadas, inclusive
-`1.005`: não há arredondamento financeiro implícito. Entradas negativas,
-expoentes e espaços são inválidos. `rehydrate` e operações internas aceitam
-sinais para representar diferenças. Limite: 28 dígitos inteiros e 2 fracionários,
-validado tanto pelo domínio quanto pelo banco. Overflow lança erro.
+Os valores entram e saem como strings. O banco usa `NUMERIC`, e o MikroORM
+devolve esses campos como strings. Dinheiro não passa por `number`, `Number`
+ou `parseFloat`. Contagens, versões e tempos podem usar `number` normalmente.
 
-Moedas são identificadores ISO reconhecidos pelo ICU do runtime. O domínio
-suporta, por exemplo, BRL e USD e rejeita operações entre moedas diferentes.
-A futura API restringirá a operação a BRL, permitido pelo enunciado.
+Valores com zero, uma ou duas casas são normalizados para duas casas na saída.
+Mais de duas casas são rejeitadas, sem arredondamento automático. Entradas
+negativas, vazias, com espaços, notação científica, NaN ou Infinity também são
+rejeitadas. O limite é de 28 dígitos inteiros e dois decimais. Operações internas
+podem representar valores negativos, como a diferença de uma reconciliação.
 
-## Domínio e ORM
+O domínio permite moedas diferentes e impede operações entre elas. A API aceita
+apenas BRL, conforme a simplificação permitida no desafio. `Money` é imutável:
+uma soma ou subtração devolve outro objeto.
 
-Money, Wallet, WagerTransaction e WalletLedgerEntry têm construtores privados,
-factories e rehydrate. Rehydrate reconstrói estado, sem reaplicar transições.
-O domínio não importa NestJS nem MikroORM. Datas expostas são cópias.
+## Domínio e persistência
 
-Os registros do ORM são DTOs de persistência, separados do domínio; por isso
-não encapsulam transições financeiras. EntitySchema evita decorators e
-acoplamento do domínio ao banco. DecimalType('string') mantém NUMERIC exato.
-WalletRecord demonstra o caminho domínio → registro → domínio, inclusive para
-valores maiores que Number.MAX_SAFE_INTEGER.
+Escolhi MikroORM, que era a opção preferencial do enunciado. As classes de
+domínio não importam NestJS nem o ORM. Elas têm construtores privados, métodos
+de criação e `rehydrate`, que reconstrói o estado salvo sem repetir transições.
 
-## Schema e migrations
+Os registros de persistência ficam separados dessas classes. Usei `EntitySchema`
+para fazer o mapeamento e `DecimalType('string')` nos valores monetários.
 
-Migrations são SQL versionado, com up/down, executado por um runner pequeno via
-MikroORM. Cada execução é uma transação; a tabela schema_migrations registra o
-histórico. Um advisory lock transacional coordena somente migrações simultâneas.
-Operações financeiras nunca usarão esse lock de schema. Não há schema sync nem
-geração automática de DDL em startup.
+As migrations são SQL versionado, com `up` e `down`, executado pelo MikroORM.
+Não uso sincronização automática de schema. A tabela `schema_migrations`
+registra o que já foi aplicado. O lock usado pelo runner é apenas para impedir
+migrations simultâneas; ele não participa das operações financeiras.
 
-NUMERIC sem typmod, com CHECK de escala e magnitude, evita que NUMERIC(p,2)
-arredonde um valor inválido antes da validação. CHECKs impedem saldo negativo,
-valores não finitos e aritmética inválida do ledger. FKs compostas ligam wallet,
-player e moeda, e impedem ledger de outra wallet/moeda para a transação.
+O banco também protege as regras, sem depender apenas do TypeScript:
 
-UNIQUEs protegem player+moeda, idempotency key, provider+externalTransactionId,
-transaction+wallet no ledger, uma OPENING por wallet e consumer+messageId na
-inbox. Idempotency key tem escopo global: o header é a identidade exata;
-recomenda-se provider:externalTransactionId para evitar colisões entre provedores.
-Índice parcial restringe reversões PROCESSED por referência+kind; uma rejeição
-não bloqueia uma futura tentativa com nova identidade.
+- Uma wallet por jogador e moeda.
+- Saldo não negativo, valores finitos e no máximo duas casas decimais.
+- Unicidade da chave de idempotência e da identidade externa do provedor.
+- No máximo um lançamento por transação e wallet, e uma OPENING por wallet.
+- Uma reversão processada por referência e tipo de reversão.
+- Unicidade de consumerName/messageId na inbox.
+- Chaves estrangeiras para manter wallet, jogador e moeda compatíveis.
+- Cálculo correto entre saldo anterior, movimento e saldo posterior no ledger.
 
-Triggers proíbem UPDATE, DELETE e TRUNCATE do ledger, inclusive alterações
-que manteriam o mesmo valor. Não há cascade de exclusão. Como em qualquer
-PostgreSQL, o administrador pode alterar o schema; o usuário da aplicação em
-produção não deve ser dono das tabelas. O usuário do Compose é administrativo
-apenas para simplificar o ambiente do desafio.
+Usei `NUMERIC` sem escala fixa no tipo da coluna e validei a escala com `CHECK`.
+Isso evita que o banco arredonde uma entrada com casas extras antes de validá-la.
+Triggers impedem UPDATE, DELETE e TRUNCATE do ledger. O usuário do banco local
+é administrativo para facilitar o setup; em produção, a aplicação deveria ter
+permissões mais restritas.
 
-As constraints não substituem o caso de uso: as mudanças de wallet, ledger,
-transação, inbox e outbox precisarão ser efetuadas na mesma transação. O teste
-deste bloco comprova rollback conjunto do armazenamento, ainda não o fluxo
-HTTP/SQS completo. Reconciliação será usada para verificar o saldo contra o ledger.
+## Transações e concorrência
 
-## Interpretações do domínio
+O processamento usa `EntityManager.transactional()` e `SELECT FOR UPDATE` na
+wallet. Enquanto uma operação está alterando aquela wallet, outra operação da
+mesma wallet espera. Wallets diferentes podem ser processadas em paralelo.
 
-- OPENING é interno. A validação de entrada HTTP/SQS o impedirá externamente.
-- Wallet abre em version 1, inclusive com saldo inicial positivo; OPENING registra
-  esse crédito sem incrementar a versão de novo.
-- Operações financeiras exigem valor positivo; wallet pode abrir com zero.
-  LOSS aceita valor não negativo, sem produzir movimento ou ledger.
-- WIN e LOSS podem referenciar BET. Se a referência é informada, ela será validada
-  ou ficará pendente, assim como reversões. WIN pode ter valor diferente da BET.
-- REFUND só referencia BET; ROLLBACK referencia BET, WIN ou REFUND. Valores de
-  reversão são integrais, e provider/player/wallet/moeda/rodada devem coincidir.
-- A proibição de repetição é por tipo: REFUND e ROLLBACK da mesma BET podem
-  coexistir, conforme o texto. Não adicionamos exclusão entre os dois tipos.
-- PROCESSED, REJECTED e FAILED são terminais. PENDING e PENDING_REFERENCE podem
-  ir a estados terminais; PENDING_REFERENCE pode permanecer pendente no retry.
-- Falta de saldo em BET: INSUFFICIENT_FUNDS. Débito de reversão sem saldo:
-  REVERSAL_INSUFFICIENT_FUNDS. Falhas são códigos estáveis de domínio.
+Wallet, transação, ledger, inbox e outbox são confirmados juntos. Se a gravação
+de qualquer parte falhar, tudo volta ao estado anterior. Os flushes dentro do
+caso de uso servem para respeitar a ordem das chaves estrangeiras; não são commits.
 
-## Hash canônico
+O lock tem timeout de 3s, os comandos financeiros têm timeout de 10s e o pool
+tem até dez conexões por instância, com espera de até 15s por conexão. Disputas
+de unicidade, deadlocks e falhas de serialização permitem até três execuções,
+sempre em uma transação nova após o rollback.
 
-SHA-256 de JSON UTF-8 com chaves ordenadas recursivamente. Campos incluídos:
-providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind,
-money normalizado como amount/currency e referenceExternalTransactionId (null
-quando ausente). Header, chave de idempotência e metadados de transporte ficam
-fora. `25`, `25.0` e `25.00` têm a mesma representação monetária canônica.
-O caso de uso persistirá esse hash e o resultado original para replay.
+## Idempotência
 
-## Processamento financeiro — bloco 03
+A `Idempotency-Key` do header é obrigatória e tem escopo global. A sugestão é
+usar `providerId:externalTransactionId`.
 
-A unidade de concorrência é a wallet. FinancialService usa MikroORM
-EntityManager.transactional e SELECT FOR UPDATE na linha da wallet. Não há
-lock financeiro global. Lock timeout: 3s. Pool: até 10 conexões por instância,
-com espera de aquisição de até 15s para acomodar bursts sem aumentar conexões.
-Replays retornam o resultado salvo,
-incluindo o saldo observado na execução original. Disputas de UNIQUE entre
-wallets e deadlocks/serialization failures admitem até três execuções, sempre
-em uma transação nova após rollback; a nova leitura classifica replay/conflito.
+Para comparar os pedidos, calculo SHA-256 de um JSON UTF-8 com as chaves
+ordenadas recursivamente. Entram no hash: providerId, externalTransactionId,
+playerId, walletId, roundId, gameId, kind, money e referenceExternalTransactionId.
+O dinheiro é normalizado antes do hash, UUIDs ficam em minúsculas e referência
+ausente vira null. Header e dados de transporte ficam de fora.
 
-A chave de idempotência é global. Uma externalTransactionId já aceita pelo
-provider com outra chave produz EXTERNAL_TRANSACTION_CONFLICT (409), mesmo
-com payload igual. Mesma chave e payload divergente: IDEMPOTENCY_CONFLICT.
-UUIDs são normalizados para minúsculas antes do hash.
+Mesma chave e mesmo conteúdo devolvem o resultado salvo, incluindo o saldo
+observado no processamento original. Mesma chave com outro conteúdo gera
+`IDEMPOTENCY_CONFLICT`. Reusar a identidade externa com outra chave gera
+`EXTERNAL_TRANSACTION_CONFLICT`. Os dois conflitos retornam HTTP 409.
 
-As entradas são validadas antes da aceitação. Apenas BRL é exposta na API.
-playerId incompatível com wallet é contrato inválido (400), não uma transação
-financeira aceita; isso evita violar a FK composta e não cria wager/ledger.
-BET não aceita referência; WIN/LOSS podem referenciar BET. Referência ausente
-ou ainda não terminal produz PENDING_REFERENCE. Referência terminal rejeitada
-produz REFERENCE_NOT_PROCESSED. Os retries agendados serão do próximo bloco;
-um replay HTTP não tenta aplicar novamente uma pendência.
+A inbox tem uma verificação adicional: seu hash combina o hash de negócio com
+a chave de idempotência. Assim, alterar a chave no mesmo messageId também é um
+conflito. Não há cache em memória garantindo idempotência.
 
-HTTP: criação 201; operação PROCESSED 200; REJECTED 422 com failureCode e
-resultado persistido; pendência 202; payload inválido 400; recurso ausente 404;
-conflito 409; indisponibilidade transitória classificada 503. Consultar uma
-transação rejeitada usa GET 200 e informa status/failureCode no corpo.
+## Regras e interpretações
 
-Wallet, wager, ledger, inbox opcional e outbox são gravados na mesma transação.
-Flushes intermediários garantem a ordem das FKs e não são commits. A inbox
-salva hash de { hash: hash de negócio, idempotencyKey } para detectar alteração
-da chave no mesmo messageId; correlationId e metadados não alteram esse hash.
-Classes concretas de IntegrationEvent definem eventType/version. OPENING gera
-crédito de ledger e eventos; LOSS gera WagerTransactionProcessed sem evento
-de saldo. Nenhum evento é enviado ao broker neste bloco.
+- A wallet começa na versão 1. Saldo inicial positivo gera OPENING e um crédito
+  no ledger, sem incrementar a versão de novo. Saldo inicial zero não gera crédito.
+- OPENING é interna e não pode ser enviada por HTTP ou SQS.
+- Operações que movimentam saldo exigem valor positivo. LOSS aceita zero e não
+  altera saldo, versão ou ledger, mas termina como PROCESSED e gera evento.
+- BET não aceita referência. WIN e LOSS podem referenciar uma BET; se fizerem
+  isso, a referência também precisa ser validada.
+- REFUND referencia BET; ROLLBACK referencia BET, WIN ou REFUND. A reversão é
+  integral e exige mesmo provedor, jogador, wallet, moeda e rodada.
+- A restrição de reversão é por tipo. REFUND e ROLLBACK da mesma BET podem
+  coexistir, seguindo a leitura adotada do enunciado.
+- PROCESSED, REJECTED e FAILED são terminais. Uma reversão cria outra transação;
+  ela não altera o histórico da operação original.
 
-Paginação crescente por createdAt/id usa cursor base64url com identidade da
-wallet e última entrada. O timestamp é comparado no banco para preservar sua
-precisão. O cursor é opaco para o cliente, não é mecanismo de autorização.
-Reconciliação segura o mesmo lock da wallet durante soma do ledger e leitura
-de saldo, evitando divergência artificial por escrita concorrente. A resposta
-expõe divergência sem corrigi-la; logs/métricas de divergência entram no bloco
-de observabilidade.
+Os principais códigos de falha financeira são:
 
-Testes de integração usam bancos temporários próprios. A suíte financeira
-exercita o caso de uso real com conexões concorrentes e falha injetada por
-trigger na outbox. A suíte HTTP usa uma API Nest real, PostgreSQL e readiness
-SQS. Essas provas ainda não substituem testes de três processos e crash/ack.
+| Código | Motivo |
+|---|---|
+| INSUFFICIENT_FUNDS | Aposta sem saldo suficiente |
+| REVERSAL_INSUFFICIENT_FUNDS | Débito de reversão deixaria saldo negativo |
+| INVALID_REFERENCE | Tipo, valor ou identidade da referência incompatível |
+| REFERENCE_NOT_PROCESSED | A referência terminou sem ser processada |
+| REFERENCE_NOT_FOUND | Esgotaram as tentativas de aguardar a referência |
+| REVERSAL_ALREADY_PROCESSED | A referência já recebeu aquela reversão |
+| INFRASTRUCTURE_RETRY_EXHAUSTED | O processamento por SQS esgotou suas tentativas |
 
-## Próximos blocos
+`INVALID_MONEY`, `INVALID_AMOUNT` e `CURRENCY_MISMATCH` identificam problemas
+de valor ou moeda. `INVALID_TRANSACTION_STATE` indica uma transição indevida.
+Payload inválido e conflito de identidade podem ser recusados antes de aceitar
+a operação; nem todo erro cria uma transação REJECTED. Por exemplo, playerId
+incompatível com a wallet retorna 400 sem inserir uma transação financeira.
 
-O consumidor SQS fará ack só após commit. Outbox será publicada por worker após commit, com coordenação de
-publishers e consumidores idempotentes. Pendências terão retry persistente e
-limite documentado. Esses componentes e seus testes ainda não estão entregues.
+No HTTP, uso 201 para criar wallet, 200 para operação processada, 202 para
+pendência, 400 para contrato inválido, 404 para recurso ausente, 409 para
+conflito, 422 para rejeição financeira, 500 para FAILED e 503 para falha
+transitória. Consultar uma transação rejeitada retorna 200, com seu estado no corpo.
 
-## Autenticação
+## Mensageria
 
-Não implementar IdP neste timebox: o enunciado aceita a decisão e não atribui
-pontos a autenticação. O HTTP tem um ProviderIdentityPort explícito e adapter
-de desenvolvimento no-op. Em produção, um adapter validaria JWT de um IdP externo e vincularia
-as claims ao providerId, sem tabela local de senhas. Health ficará aberto e a
-fila será canal interno confiável, mantendo validações de domínio.
+O consumidor SQS valida o envelope e chama o mesmo caso de uso da API. A inbox
+é identificada por consumerName/messageId. O ack, feito com DeleteMessage,
+só acontece depois do commit.
+
+Rejeições financeiras são persistidas e recebem ack. Mensagens inválidas,
+wallets inexistentes e conflitos de identidade vão para a DLQ. Falhas de
+infraestrutura recebem novas tentativas, com espera de 2, 4, 8 e 16 segundos.
+No quinto recebimento, o consumidor tenta salvar FAILED e encaminha a mensagem
+à DLQ. Se o banco continuar indisponível, o comando na DLQ preserva a auditoria.
+
+A mensagem é enviada à DLQ antes de ser apagada da origem. Pode haver duplicação
+se o processo morrer entre essas chamadas. Um replay de FAILED também tenta
+encaminhar à DLQ, para não perder essa etapa. Falha no ack de uma operação já
+confirmada não muda seu resultado financeiro.
+
+A visibilidade é de 60s e é renovada a cada 15s durante o processamento. Na
+parada, o worker não inicia novas recepções, mas aguarda o long poll em curso
+terminar. Ele espera até 10s, com timeout da chamada de 15s. Se chegar uma
+mensagem durante a parada, sua visibilidade é devolvida. O trabalho em andamento
+termina antes de fechar as conexões.
+
+### Publicação da outbox
+
+O evento é salvo na transação financeira e publicado depois por outro processo.
+Cada publisher busca uma linha com `FOR UPDATE SKIP LOCKED`. Isso permite que
+outros publishers busquem linhas diferentes.
+
+Mantive o lock durante o envio ao SQS, com timeout de 3s. Isso ocupa uma conexão
+enquanto envia, mas foi uma escolha simples para evitar um mecanismo adicional
+de reserva e expiração de mensagens.
+
+Se o processo morrer depois do envio e antes de marcar a publicação, a linha
+continua pendente. O próximo envio mantém o mesmo eventId. Por isso, consumidores
+dos eventos precisam deduplicar esse ID de forma persistente. A deduplicação
+FIFO ajuda, mas não substitui essa proteção. Falhas de envio têm backoff de 1s
+até 60s; eventos da outbox não são descartados por esgotamento de tentativas.
+
+### Referências fora de ordem
+
+Referências ausentes ou ainda não concluídas deixam a operação em
+PENDING_REFERENCE. O worker busca até dez pendências vencidas, bloqueia wallet
+e transação e confere novamente o estado e a agenda antes de aplicar as regras.
+
+São até dez tentativas, com espera crescente de 1s até 60s: aproximadamente
+cinco minutos, mais atrasos de processamento ou indisponibilidade. Escolhi esse
+limite para a demonstração local. Ao esgotá-lo, a operação é rejeitada com
+REFERENCE_NOT_FOUND e gera um evento de rejeição, sem ledger.
+
+Reenviar o pedido não zera as tentativas nem antecipa a agenda. Erros de banco
+desfazem a tentativa e não aumentam a contagem. Retries que continuam pendentes
+não criam novos eventos de pendência. Ao terminar, o resultado da transação é
+atualizado; o resultado da inbox continua representando o aceite da mensagem.
+Os eventos da retomada usam o ID da transação como correlationId e causationId.
+
+## Consultas e reconciliação
+
+O ledger usa cursor em base64url com walletId e ID da última entrada. A ordem
+é por createdAt e ID. A comparação de timestamps acontece no banco para não
+perder precisão. O cursor não é uma forma de autorização.
+
+A reconciliação segura o mesmo lock da wallet enquanto compara saldo e soma
+do ledger. Isso evita comparar dados de momentos diferentes durante uma
+operação concorrente. Uma divergência aparece na resposta, no log e na métrica;
+o sistema não corrige o saldo automaticamente.
+
+## Docker, métricas e testes
+
+API, worker e setup usam a mesma imagem Bun. O setup aplica migrations e cria
+as filas antes das aplicações. As portas das APIs são 3001 a 3003; as dos
+workers são 9101 a 9103, publicadas somente em localhost. O Compose permite
+até 90s para encerrar os processos.
+
+O cliente SQS usa o endpoint configurado, porque as URLs anunciadas pelo
+LocalStack podem conter localhost e precisam funcionar também nos containers.
+
+As métricas ficam em `/metrics`, em formato Prometheus. Contadores e histograma
+de latência são por processo e reiniciam com ele. Status das transações,
+pendências da outbox e idade do evento pendente mais antigo vêm do banco
+compartilhado; essas métricas não devem ser somadas entre instâncias. Sem banco,
+database_up fica em zero e as métricas que dependem dele são omitidas.
+
+Os logs são JSON, com os IDs de contexto disponíveis, sem registrar montantes
+ou payloads financeiros completos. Não uso IDs de wallet ou jogador como
+labels das métricas, para não criar uma quantidade crescente de séries.
+
+Os testes usam PostgreSQL e SQS reais, com bancos, filas e containers próprios.
+Além dos testes de domínio, há testes de atomicidade, duplicação, reversões,
+referências pendentes e concorrência entre três processos. Fixtures de teste
+pausam o processo nas janelas de commit/ack e envio/marcação; o Docker envia
+SIGKILL e outro processo recupera o trabalho. Também há testes de SIGTERM e
+reinício. Essas barreiras não existem na API nem no worker de produção.
+
+## Autenticação e limites
+
+Não implementei autenticação completa, conforme permitido no desafio. Há uma
+`ProviderIdentityPort` com adapter local que não autentica. Para integrar um
+IdP externo, esse adapter validaria o JWT e vincularia o provedor às claims.
+Não há tabela local de senhas. Os endpoints de health ficam abertos.
+
+PostgreSQL tem volume persistente. O LocalStack local não tem persistência
+configurada; a aplicação não oferece recuperação para perda dos dados do
+broker. Reiniciar apenas as aplicações mantém o estado do banco e das filas.
+
+Não implementei partidas dobradas, dashboard, tracing ou teste de carga.
+O foco foi cobrir os requisitos obrigatórios e conseguir explicar as decisões.

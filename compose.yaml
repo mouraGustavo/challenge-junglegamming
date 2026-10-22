@@ -1,3 +1,20 @@
+name: challenge-junglegamming
+
+x-app: &app
+  image: challenge-junglegamming:local
+  build: .
+  profiles: [app]
+  environment: &app-env
+    HOST: 0.0.0.0
+    PORT: 3000
+    DB_HOST: postgres
+    DB_PORT: 5432
+    SQS_ENDPOINT: http://localstack:4566
+  depends_on:
+    setup:
+      condition: service_completed_successfully
+  stop_grace_period: 90s
+
 services:
   postgres:
     image: postgres:17.4-alpine
@@ -27,5 +44,42 @@ services:
       interval: 3s
       timeout: 5s
       retries: 40
+  setup:
+    <<: *app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    command: ["sh", "-c", "bun run db:migrate && bun run infra:init"]
+  api-1: &api
+    <<: *app
+    ports: ["127.0.0.1:3001:3000"]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:3000/health/ready');process.exit(r.ok?0:1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+  api-2:
+    <<: *api
+    ports: ["127.0.0.1:3002:3000"]
+  api-3:
+    <<: *api
+    ports: ["127.0.0.1:3003:3000"]
+  worker-1: &worker
+    <<: *app
+    command: ["bun", "dist/src/worker.js"]
+    ports: ["127.0.0.1:9101:9100"]
+    healthcheck:
+      test: ["CMD", "bun", "-e", "const r=await fetch('http://127.0.0.1:9100/health/ready');process.exit(r.ok?0:1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+  worker-2:
+    <<: *worker
+    ports: ["127.0.0.1:9102:9100"]
+  worker-3:
+    <<: *worker
+    ports: ["127.0.0.1:9103:9100"]
 volumes:
   postgres-data:
